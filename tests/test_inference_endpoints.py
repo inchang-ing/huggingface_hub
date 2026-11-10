@@ -438,3 +438,54 @@ def test_resume(mock: Mock):
     mock.return_value = InferenceEndpoint.from_raw(MOCK_INITIALIZING, namespace="foo")
     endpoint.resume()
     mock.assert_called_once_with(namespace="foo", name="my-endpoint-name", token=None, running_ok=True)
+
+
+@patch("huggingface_hub.hf_api.get_session")
+def test_list_inference_endpoints_propagates_api_and_token(mock_get_session: Mock):
+    """Regression test for #5327 (part 2).
+
+    An `InferenceEndpoint` returned by `HfApi(token=...)` must keep the api
+    instance and its token, even when `token` is not explicitly passed to the
+    method. Previously `from_raw` was called without `api=self`, so the endpoint
+    fell back to a fresh `HfApi()` with `_token=None`.
+    """
+    api = HfApi(token="hf_my_token")
+    mock_get_session.return_value.get.return_value = Mock(
+        status_code=200, json=lambda: {"items": [MOCK_RUNNING]}
+    )
+
+    endpoints = api.list_inference_endpoints(namespace="alice")
+
+    assert len(endpoints) == 1
+    assert endpoints[0]._api is api
+    assert endpoints[0]._token == "hf_my_token"
+
+
+@patch("huggingface_hub.hf_api.get_session")
+def test_list_inference_endpoints_all_namespaces_propagates_token(mock_get_session: Mock):
+    """Regression test for #5327 (part 1).
+
+    `list_inference_endpoints(namespace="*")` must propagate the token on every
+    request. Previously it called the module-level helper (and the personal
+    namespace call omitted `token` entirely), so the personal-namespace request
+    was sent unauthenticated and failed with 401.
+    """
+    api = HfApi(token="hf_my_token")
+
+    captured = []
+
+    def fake_get(url, headers=None, **kwargs):
+        captured.append((url, headers or {}))
+        if url.endswith("/api/whoami-v2"):
+            body = {"type": "user", "name": "alice", "orgs": [{"name": "acme"}]}
+        else:
+            body = {"items": []}
+        return Mock(status_code=200, json=lambda: body)
+
+    mock_get_session.return_value.get.side_effect = fake_get
+    endpoints = api.list_inference_endpoints(namespace="*")
+
+    assert endpoints == []
+    # `_build_hf_headers` emits the lowercase ``authorization`` key.
+    auth_headers = [headers.get("authorization") for _, headers in captured]
+    assert all(h == "Bearer hf_my_token" for h in auth_headers), auth_headers
